@@ -1,6 +1,5 @@
 # 🛰️ Disaster Intelligence — Scraper + RAG Module
-
-**Module Owner:** Tanusha  
+ 
 **Project:** Disaster Intelligence using Satellite Imagery and AI  
 **Role in project:** This module provides the knowledge base for the team's larger pipeline. It collects disaster reports and technical documentation, indexes them, and answers questions with source citations.
 
