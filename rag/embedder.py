@@ -43,7 +43,20 @@ class Embedder:
         if self._model is None:
             logger.info("Loading embedding model '%s' on %s ...", self.model_name, self.device)
             from sentence_transformers import SentenceTransformer  # type: ignore
-            self._model = SentenceTransformer(self.model_name, device=self.device)
+            try:
+                self._model = SentenceTransformer(self.model_name, device=self.device)
+            except Exception as exc:
+                logger.warning(
+                    "Standard load of '%s' failed (%s). Retrying with local_files_only=True ...",
+                    self.model_name,
+                    exc,
+                )
+                try:
+                    self._model = SentenceTransformer(
+                        self.model_name, device=self.device, local_files_only=True
+                    )
+                except Exception:
+                    raise exc
             logger.info("Embedding model loaded. Dimension: %d", self.dimension)
 
     @property

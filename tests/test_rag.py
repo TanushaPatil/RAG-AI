@@ -223,3 +223,234 @@ class TestVectorStoreRetriever:
         context = retriever.format_context(results)
         assert "[SOURCE 1]" in context
         assert "URL:" in context
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Generator & LLM integration tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestGenerator:
+    def test_offline_mode_default_when_no_api_keys(self, monkeypatch):
+        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        from rag.generator import Generator
+        gen = Generator()
+        assert gen._backend == "offline"
+
+        chunks = [
+            {
+                "chunk_id": "c1",
+                "text": "Sentinel-1 SAR detected flood extent of 150,000 hectares.",
+                "metadata": {"title": "Copernicus Flood Report", "source_url": "https://example.com/c1"},
+                "relevance_score": 0.85,
+            }
+        ]
+        resp = gen.generate("What was the flood extent?", chunks, context="Context block")
+        assert resp.offline_mode is True
+        assert resp.model_used == "offline"
+        assert len(resp.sources) == 1
+        assert resp.sources[0]["url"] == "https://example.com/c1"
+
+    def test_empty_chunks_returns_insufficient_evidence(self):
+        from rag.generator import Generator
+        gen = Generator()
+        resp = gen.generate("Unknown disaster in nonexistent region?", [], context="")
+        assert "Insufficient evidence" in resp.answer
+        assert resp.chunk_count == 0
+        assert resp.uncertainty_or_limitations is not None
+
+    def test_gemini_generation_mocked(self, monkeypatch):
+        from unittest.mock import MagicMock, patch
+        monkeypatch.setenv("GOOGLE_API_KEY", "fake-gemini-key")
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        mock_model = MagicMock()
+        mock_response = MagicMock()
+        mock_response.text = (
+            "According to [SOURCE 1], Sentinel-1 SAR imagery detected flood extents "
+            "across 180,000 hectares in Sylhet, Bangladesh.\n\n"
+            "## Sources\n[1] GDACS Alert (https://gdacs.org/alert/1)"
+        )
+        mock_model.generate_content.return_value = mock_response
+
+        with patch("google.generativeai.GenerativeModel", return_value=mock_model):
+            from rag.generator import Generator
+            gen = Generator(model="gemini-1.5-flash")
+            assert gen._backend == "gemini"
+
+            chunks = [
+                {
+                    "chunk_id": "c1",
+                    "text": "Flood footprint 180,000 hectares in Sylhet.",
+                    "metadata": {"title": "GDACS Alert", "source_url": "https://gdacs.org/alert/1"},
+                    "relevance_score": 0.95,
+                }
+            ]
+            resp = gen.generate("What is the flood footprint?", chunks, context="Retrieved Context")
+            assert resp.offline_mode is False
+            assert resp.model_used == "gemini-1.5-flash"
+            assert "180,000 hectares" in resp.answer
+            assert len(resp.cited_sources) == 1
+            assert resp.cited_sources[0]["url"] == "https://gdacs.org/alert/1"
+
+    def test_openai_generation_mocked(self, monkeypatch):
+        from unittest.mock import MagicMock, patch
+        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+        monkeypatch.setenv("OPENAI_API_KEY", "fake-openai-key")
+
+        mock_client = MagicMock()
+        mock_choice = MagicMock()
+        mock_choice.message.content = (
+            "Based on [SOURCE 1], Google Earth Engine uses Sentinel-1 GRD imagery "
+            "for backscatter change detection.\n\n"
+            "## Sources\n[1] GEE Guide (https://developers.google.com/earth-engine)"
+        )
+        mock_response = MagicMock()
+        mock_response.choices = [mock_choice]
+        mock_client.chat.completions.create.return_value = mock_response
+
+        with patch("openai.OpenAI", return_value=mock_client):
+            from rag.generator import Generator
+            gen = Generator(model="gpt-4o-mini")
+            assert gen._backend == "openai"
+
+            chunks = [
+                {
+                    "chunk_id": "c1",
+                    "text": "GEE uses Sentinel-1 for change detection.",
+                    "metadata": {"title": "GEE Guide", "source_url": "https://developers.google.com/earth-engine"},
+                    "relevance_score": 0.90,
+                }
+            ]
+            resp = gen.generate("How does GEE detect change?", chunks, context="Retrieved Context")
+            assert resp.offline_mode is False
+            assert "backscatter change detection" in resp.answer
+            assert resp.cited_sources[0]["title"] == "GEE Guide"
+
+    def test_invalid_api_credentials_fallback(self, monkeypatch):
+        from unittest.mock import MagicMock, patch
+        monkeypatch.setenv("GOOGLE_API_KEY", "invalid-key")
+
+        mock_model = MagicMock()
+        mock_model.generate_content.side_effect = Exception("API_KEY_INVALID: 403 Forbidden")
+
+        with patch("google.generativeai.GenerativeModel", return_value=mock_model):
+            from rag.generator import Generator
+            gen = Generator()
+            chunks = [
+                {
+                    "chunk_id": "c1",
+                    "text": "Fallback source passage text.",
+                    "metadata": {"title": "Report", "source_url": "https://example.com/rep"},
+                    "relevance_score": 0.80,
+                }
+            ]
+            resp = gen.generate("Any question?", chunks, context="Sample context block")
+            assert resp.offline_mode is True
+            assert "LLM Generation Unavailable" in resp.answer
+            assert "Sample context block" in resp.answer
+            assert resp.error is not None
+
+    def test_detect_conflicting_reports_and_uncertainty(self):
+        from rag.generator import Generator
+        gen = Generator()
+        chunks = [
+            {
+                "chunk_id": "c1",
+                "text": "Death toll reported at 15 by Local Agency.",
+                "metadata": {"title": "Report A", "source_url": "https://example.com/a"},
+                "relevance_score": 0.70,
+            }
+        ]
+        conflicting_answer = (
+            "Source [SOURCE 1] notes 15 fatalities, however there is conflicting information "
+            "and differing figures reported across authorities."
+        )
+        uncertainty = gen._detect_uncertainties(conflicting_answer, chunks)
+        assert uncertainty is not None
+        assert "Conflicting reports" in uncertainty
+
+    def test_disaster_context_injected_into_prompt(self):
+        from rag.retriever import Retriever
+        from unittest.mock import MagicMock
+        store = MagicMock()
+        store.count.return_value = 1
+        store.query.return_value = []
+        retriever = Retriever(vector_store=store)
+
+        context_dict = {
+            "hazard_type": "flood",
+            "target_location": "Valencia, Spain",
+            "satellite_sensor": "Sentinel-1A IW GRD",
+        }
+        formatted = retriever.format_context([], disaster_context=context_dict)
+        assert "Operational Disaster Context" in formatted
+        assert "Valencia, Spain" in formatted
+        assert "Sentinel-1A IW GRD" in formatted
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Unified DisasterRAGPipeline tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDisasterRAGPipeline:
+    @pytest.fixture
+    def populated_pipeline(self, tmp_path):
+        from rag.embedder import Embedder
+        from rag.pipeline import DisasterRAGPipeline
+        from rag.vector_store import VectorStore
+
+        embedder = Embedder()
+        store_dir = str(tmp_path / "pipeline_chroma")
+        store = VectorStore(embedder=embedder, persist_dir=store_dir, collection_name="pipeline_test")
+
+        doc1 = make_doc(
+            content=(
+                "Sentinel-1 SAR flood monitoring in Bangladesh Sylhet division. "
+                "Floods inundated 180,000 hectares on 2024-06-15. "
+                "Event ID: 1104099. Severity: 5187 ha. Affected Population: 4000000. "
+                "Coordinates: [24.8949, 91.8687]."
+            )
+        )
+        chunks = chunk_document(doc1, chunk_size=80, overlap=10)
+        store.add_chunks(chunks)
+
+        pipeline = DisasterRAGPipeline(persist_dir=store_dir)
+        pipeline._store = store
+        pipeline._embedder = embedder
+        return pipeline
+
+    def test_pipeline_end_to_end_query(self, populated_pipeline):
+        res = populated_pipeline.query(
+            question="What is the flood footprint in Sylhet, Bangladesh?",
+            disaster_context={"hazard": "flood", "location": "Sylhet"},
+        )
+        assert res.question == "What is the flood footprint in Sylhet, Bangladesh?"
+        assert len(res.evidence) > 0
+        assert len(res.source_urls) > 0
+        assert res.timestamps["queried_at"] is not None
+        assert len(res.disaster_events) > 0
+
+        # Check extracted disaster event
+        ev = res.disaster_events[0]
+        assert ev["event_id"] == "1104099"
+        assert ev["coordinates"] == [24.8949, 91.8687]
+        assert "4000000" in ev["affected_population"]
+
+    def test_pipeline_json_serialization(self, populated_pipeline):
+        res = populated_pipeline.query("How does SAR detect floods?")
+        data = res.to_dict()
+        assert "question" in data
+        assert "answer" in data
+        assert "evidence" in data
+        assert "source_urls" in data
+        assert "disaster_events" in data
+        assert "timestamps" in data
+
+    def test_pipeline_display_output(self, populated_pipeline):
+        res = populated_pipeline.query("How does SAR detect floods?")
+        display_str = res.display()
+        assert "[QUESTION]" in display_str
+        assert "[ANSWER]" in display_str
+        assert "[SOURCES]" in display_str

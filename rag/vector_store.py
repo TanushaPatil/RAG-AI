@@ -20,7 +20,10 @@ from rag.embedder import Embedder
 logger = logging.getLogger(__name__)
 
 DEFAULT_COLLECTION = "disaster_intelligence"
-DEFAULT_PERSIST_DIR = os.environ.get("CHROMA_PERSIST_DIR", "./data/chroma_db")
+DEFAULT_PERSIST_DIR = os.environ.get(
+    "CHROMA_PERSIST_DIR",
+    str(Path(__file__).resolve().parent.parent / "data" / "chroma_db"),
+)
 
 
 class VectorStore:

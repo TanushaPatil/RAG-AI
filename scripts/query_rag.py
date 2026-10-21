@@ -36,16 +36,17 @@ logging.basicConfig(
 logger = logging.getLogger("query_rag")
 
 
-def build_rag(persist_dir: str, top_k: int, final_k: int):
-    from rag.embedder import Embedder
-    from rag.generator import Generator
-    from rag.retriever import Retriever
-    from rag.vector_store import VectorStore
+def build_rag(persist_dir: str, top_k: int, final_k: int, model: str | None = None):
+    from rag.pipeline import DisasterRAGPipeline
 
-    embedder = Embedder()
-    store = VectorStore(embedder=embedder, persist_dir=persist_dir)
+    pipeline = DisasterRAGPipeline(
+        persist_dir=persist_dir,
+        top_k=top_k,
+        final_k=final_k,
+        model=model,
+    )
 
-    if store.count() == 0:
+    if pipeline.store.count() == 0:
         print(
             "\n❌ Vector index is empty!\n"
             "   Build the index first:\n"
@@ -53,28 +54,35 @@ def build_rag(persist_dir: str, top_k: int, final_k: int):
         )
         sys.exit(1)
 
-    retriever = Retriever(vector_store=store, top_k=top_k, final_k=final_k)
-    generator = Generator()
-    return retriever, generator
+    return pipeline
 
 
-def ask(question: str, retriever, generator, region_filter: str | None = None):
-    where = None
-    if region_filter:
-        where = {"region": region_filter}
+def ask(
+    pipeline,
+    question: str,
+    region_filter: str | None = None,
+    hazard_filter: str | None = None,
+    disaster_context: dict | None = None,
+    json_output: bool = False,
+):
+    import json
 
-    chunks = retriever.retrieve(question, where=where)
-    if not chunks:
-        print("\n⚠️  No relevant documents found for your question.")
-        print("Try running the scraper or building the index with fixtures first.")
-        return
+    result = pipeline.query(
+        question=question,
+        disaster_context=disaster_context,
+        region_filter=region_filter,
+        hazard_filter=hazard_filter,
+    )
 
-    context = retriever.format_context(chunks)
-    response = generator.generate(question=question, chunks=chunks, context=context)
-    print(response.display())
+    if json_output:
+        print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
+    else:
+        print(result.display())
 
 
 def main():
+    import json
+
     parser = argparse.ArgumentParser(
         description="Query the Disaster Intelligence RAG system",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -82,6 +90,8 @@ def main():
 Examples:
   python scripts/query_rag.py "How is Sentinel-1 used for flood detection?"
   python scripts/query_rag.py "What is the impact of cyclone Mocha?" --top-k 8
+  python scripts/query_rag.py "What floods occurred in Mexico?" --region Mexico --hazard flood
+  python scripts/query_rag.py "Recent disaster summary" --json
   python scripts/query_rag.py --interactive
         """,
     )
@@ -95,6 +105,11 @@ Examples:
         "--persist-dir",
         default="data/chroma_db",
         help="ChromaDB directory (default: data/chroma_db)",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="Model override (e.g. gemini-1.5-pro, gpt-4o, gpt-4o-mini)",
     )
     parser.add_argument(
         "--top-k",
@@ -111,7 +126,22 @@ Examples:
     parser.add_argument(
         "--region",
         default=None,
-        help="Optional region/country filter (e.g. 'Bangladesh')",
+        help="Optional region/country filter (e.g. 'Mexico', 'Spain', 'Turkey')",
+    )
+    parser.add_argument(
+        "--hazard",
+        default=None,
+        help="Optional hazard filter (e.g. 'flood', 'earthquake', 'wildfire', 'cyclone')",
+    )
+    parser.add_argument(
+        "--context",
+        default=None,
+        help="Operational disaster context JSON string (e.g. '{\"hazard\": \"flood\", \"location\": \"Valencia\"}')",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output structured JSON (ideal for backend API / Copernicus integration)",
     )
     parser.add_argument(
         "--interactive",
@@ -124,9 +154,28 @@ Examples:
         parser.print_help()
         sys.exit(0)
 
-    print("⏳ Loading RAG system (first run downloads embedding model ~90 MB) ...")
-    retriever, generator = build_rag(args.persist_dir, args.top_k, args.final_k)
-    print(f"✅ Index loaded ({retriever.store.count()} chunks)\n")
+    disaster_context = None
+    if args.context:
+        context_str = args.context
+        context_path = Path(context_str)
+        if context_path.exists() and context_path.is_file():
+            try:
+                disaster_context = json.loads(context_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                logger.error("Failed to read context file %s: %s", context_path, exc)
+                sys.exit(1)
+        else:
+            try:
+                disaster_context = json.loads(context_str)
+            except json.JSONDecodeError as exc:
+                logger.error("Failed to parse --context JSON: %s", exc)
+                sys.exit(1)
+
+    if not args.json:
+        print("⏳ Loading RAG system (first run downloads embedding model ~90 MB) ...")
+    pipeline = build_rag(args.persist_dir, args.top_k, args.final_k, model=args.model)
+    if not args.json:
+        print(f"✅ Index loaded ({pipeline.store.count()} chunks)\n")
 
     if args.interactive:
         print("🛰️  Disaster Intelligence RAG — Interactive Mode")
@@ -142,9 +191,23 @@ Examples:
                 break
             if not question:
                 continue
-            ask(question, retriever, generator, region_filter=args.region)
+            ask(
+                pipeline,
+                question,
+                region_filter=args.region,
+                hazard_filter=args.hazard,
+                disaster_context=disaster_context,
+                json_output=args.json,
+            )
     else:
-        ask(args.question, retriever, generator, region_filter=args.region)
+        ask(
+            pipeline,
+            args.question,
+            region_filter=args.region,
+            hazard_filter=args.hazard,
+            disaster_context=disaster_context,
+            json_output=args.json,
+        )
 
 
 if __name__ == "__main__":
